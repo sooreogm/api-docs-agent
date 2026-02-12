@@ -238,7 +238,7 @@ def api_reference_generate_example(request: Request, body: GenerateExampleReques
     return {"code": code}
 
 
-# --- Serve frontend static export at /agent-docs (with SPA fallback) ---
+# --- Serve frontend static export at / (with SPA fallback) ---
 
 
 def _make_static_with_spa_fallback(directory: Path):
@@ -275,13 +275,17 @@ def _make_static_with_spa_fallback(directory: Path):
 
 
 if FRONTEND_OUT.is_dir():
-    # Redirect /agent-docs -> /agent-docs/ so static can serve index.html
+    # Serve frontend at / (root). Redirect old /agent-docs links to /
     @app.get("/agent-docs", include_in_schema=False)
     def redirect_agent_docs():
-        return RedirectResponse(url="/agent-docs/", status_code=302)
+        return RedirectResponse(url="/", status_code=302)
+
+    @app.get("/agent-docs/", include_in_schema=False)
+    def redirect_agent_docs_slash():
+        return RedirectResponse(url="/", status_code=302)
 
     app.mount(
-        "/agent-docs/",
+        "/",
         _make_static_with_spa_fallback(FRONTEND_OUT),
         name="frontend",
     )

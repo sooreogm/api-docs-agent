@@ -1,10 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // When served by FastAPI at /agent-docs (Option A)
-  basePath: process.env.NODE_ENV === "production" ? "/agent-docs" : undefined,
-  assetPrefix:
-    process.env.NODE_ENV === "production" ? "/agent-docs" : undefined,
+  // Served by FastAPI at / (root)
   output: "export",
   // Dev: proxy API to FastAPI
   async rewrites() {
