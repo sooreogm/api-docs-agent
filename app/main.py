@@ -2,6 +2,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+import yaml
 
 from .config import settings
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -36,8 +37,29 @@ app.add_middleware(
 
 OPENAPI_FETCH_TIMEOUT = 10.0
 
-# When user provides a base URL (no .json), try these paths in order to discover the spec
-SPEC_URL_SUFFIXES = ["/openapi.json", "/swagger.json", "/api-docs"]
+# When user provides a base URL, try these paths in order to discover the spec.
+# Order: JSON first, then docs endpoints (content-negotiated), then YAML, then versioned/other.
+SPEC_URL_SUFFIXES = [
+    "/openapi.json",
+    "/swagger.json",
+    "/api-docs",
+    "/docs",
+    "/docs/",
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/swagger.yaml",
+    "/swagger.yml",
+    "/v3/api-docs",
+    "/v1/openapi.json",
+    "/api-docs.json",
+    "/.well-known/openapi.json",
+]
+
+# Accept header: prefer JSON, allow YAML for content negotiation
+OPENAPI_ACCEPT = (
+    "application/json, application/vnd.oai.openapi+json, "
+    "application/yaml, application/vnd.oai.openapi, text/yaml, */*"
+)
 
 
 def custom_openapi():
@@ -83,20 +105,44 @@ def _fetch_external_openapi(openapi_url: str) -> dict:
         raise HTTPException(400, detail="openapi_url must be http or https")
 
     url = openapi_url.strip().rstrip("/")
+    parsed = urlparse(url)
+    path = (parsed.path or "").rstrip("/")
+    path_lower = path.lower()
+
+    # Direct spec URL: use as single candidate
     if url.lower().endswith(".json"):
-        # User provided a direct spec URL; use it as-is
+        candidates = [url]
+    elif url.lower().endswith((".yaml", ".yml")):
+        candidates = [url]
+    elif path_lower.endswith("/docs") or path_lower.endswith("/openapi") or path_lower.endswith("/api-docs"):
+        # User gave exact docs/spec path (e.g. .../docs or .../docs/)
         candidates = [url]
     else:
         # Base URL: try common spec locations
         candidates = [url + suffix for suffix in SPEC_URL_SUFFIXES]
 
     last_error: str | None = None
+    headers = {"Accept": OPENAPI_ACCEPT}
     for spec_url in candidates:
         try:
             with httpx.Client(timeout=OPENAPI_FETCH_TIMEOUT) as client:
-                r = client.get(spec_url)
+                r = client.get(spec_url, headers=headers)
                 r.raise_for_status()
-                data = r.json()
+                content_type = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+                # Prefer JSON when Content-Type indicates it
+                if "json" in content_type or content_type in ("*/*", ""):
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = yaml.safe_load(r.text)
+                elif "yaml" in content_type or spec_url.lower().endswith((".yaml", ".yml")):
+                    data = yaml.safe_load(r.text)
+                else:
+                    # Fallback: try JSON first, then YAML
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = yaml.safe_load(r.text)
         except httpx.HTTPStatusError as e:
             last_error = f"Could not fetch spec: {e.response.status_code} from {spec_url}"
             continue
@@ -108,7 +154,7 @@ def _fetch_external_openapi(openapi_url: str) -> dict:
             continue
 
         if not isinstance(data, dict):
-            last_error = f"Response from {spec_url} is not JSON object"
+            last_error = f"Response from {spec_url} is not a valid object"
             continue
         if "paths" not in data:
             raise HTTPException(
@@ -126,13 +172,22 @@ def _fetch_external_openapi(openapi_url: str) -> dict:
 
 
 def _base_url_from_openapi_url(openapi_url: str) -> str:
-    # Return base URL from openapi_url, stripping common spec filenames (openapi.json, swagger.json, api-docs).
+    # Return base URL from openapi_url, stripping common spec paths/segments.
     parsed = urlparse(openapi_url.strip().rstrip("/"))
     if not parsed.scheme or not parsed.netloc:
         return ""
     path = parsed.path.rstrip("/")
     path_lower = path.lower()
-    if path_lower.endswith("openapi.json") or path_lower.endswith("swagger.json") or path_lower.endswith(".json") or path_lower.endswith("/api-docs"):
+    # Strip trailing spec filename or docs segment
+    spec_endings = (
+        "openapi.json", "swagger.json", "openapi.yaml", "swagger.yaml",
+        "openapi.yml", "swagger.yml", "api-docs.json",
+    )
+    if path_lower.endswith("/api-docs") or path_lower.endswith("/docs") or path_lower.endswith("/openapi"):
+        path = path.rsplit("/", 1)[0] or ""
+    elif any(path_lower.endswith(ending) for ending in spec_endings):
+        path = path.rsplit("/", 1)[0] or ""
+    elif path_lower.endswith(".json") or path_lower.endswith(".yaml") or path_lower.endswith(".yml"):
         path = path.rsplit("/", 1)[0] or ""
     return f"{parsed.scheme}://{parsed.netloc}{path}" if path else f"{parsed.scheme}://{parsed.netloc}"
 

@@ -10,3 +10,4 @@ psycopg2-binary
 loguru
 pydantic[email]
 httpx
+pyyaml
