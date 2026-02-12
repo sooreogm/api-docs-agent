@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Syntax highlighting for chat code blocks */
+@import "highlight.js/styles/github-dark.min.css";
+
+:root {
+  --side-width: 260px;
+  --chat-width: 380px;
+  --side-gap: 1rem;
+  --topbar-h: 56px;
+}
+
+body {
+  background-color: #0a0a0a;
+  @apply text-neutral-100 font-sans antialiased min-h-screen;
+  font-feature-settings: "rlig" 1, "calt" 1;
+}
+
+/* Responsive: safe area for notched devices */
+@supports (padding: env(safe-area-inset-top)) {
+  .safe-area-padding {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+}
+
+/* Chat markdown: code blocks and headings */
+.chat-markdown pre {
+  max-height: 16rem;
+  overflow: auto;
+}
+.chat-markdown pre code {
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+/* Colored method badges */
+.method-get {
+  @apply bg-sky-900/70 text-sky-300 px-1.5 py-0.5 rounded text-xs font-semibold uppercase tracking-wide;
+}
+.method-post {
+  @apply bg-emerald-900/70 text-emerald-300 px-1.5 py-0.5 rounded text-xs font-semibold uppercase tracking-wide;
+}
+.method-put {
+  @apply bg-amber-900/70 text-amber-300 px-1.5 py-0.5 rounded text-xs font-semibold uppercase tracking-wide;
+}
+.method-patch {
+  @apply bg-violet-900/70 text-violet-300 px-1.5 py-0.5 rounded text-xs font-semibold uppercase tracking-wide;
+}
+.method-delete {
+  @apply bg-rose-900/70 text-rose-300 px-1.5 py-0.5 rounded text-xs font-semibold uppercase tracking-wide;
+}

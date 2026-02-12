@@ -1,0 +1,32 @@
+# Git and env
+.git
+.gitignore
+.env
+.env.*
+
+# Python
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+
+# Frontend (we build in Docker)
+frontend/node_modules
+frontend/.next
+frontend/out
+
+# IDE and OS
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Docs and misc
+README.md
+*.md
+!frontend/README.md
+Makefile
+scripts/
+uv.lock

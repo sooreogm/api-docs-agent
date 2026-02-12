@@ -1,0 +1,287 @@
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+
+from .config import settings
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.openapi.utils import get_openapi
+from pydantic import BaseModel, Field
+from starlette.staticfiles import StaticFiles as StarletteStaticFiles
+
+from .api_reference import build_api_reference_html, build_api_reference_data
+from .docs_agent import (
+    agent_chat,
+    generate_example,
+    generate_overview_summary,
+    get_operation,
+    STACKS,
+)
+
+app = FastAPI(title="My API", version="1.0.0")
+
+# Path to frontend static export (only used when directory exists, e.g. after build)
+FRONTEND_OUT = (Path(__file__).resolve().parent.parent / "frontend" / "out")
+
+# Allow frontend hosted elsewhere to call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+OPENAPI_FETCH_TIMEOUT = 10.0
+
+# When user provides a base URL (no .json), try these paths in order to discover the spec
+SPEC_URL_SUFFIXES = ["/openapi.json", "/swagger.json", "/api-docs"]
+
+
+def custom_openapi():
+    if app.openapi_schema is None:
+        app.openapi_schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            openapi_version=app.openapi_version,
+            routes=app.routes,
+        )
+    return app.openapi_schema
+
+
+def _origin_from_url(url: str) -> str:
+    # Return scheme + netloc for allowlist checks (e.g. https://api.example.com).
+    parsed = urlparse(url.strip().rstrip("/"))
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def _check_allowed_origin(openapi_url: str) -> None:
+    # Raise 403 if ALLOWED_OPENAPI_ORIGINS is set and openapi_url's origin is not in the list.
+    if not settings.allowed_openapi_origins:
+        return
+    origin = _origin_from_url(openapi_url)
+    if not origin:
+        raise HTTPException(400, detail="openapi_url must be a valid http or https URL")
+    allowed = [o.rstrip("/") for o in settings.allowed_openapi_origins]
+    origin_normalized = origin.rstrip("/")
+    if origin_normalized not in allowed:
+        raise HTTPException(
+            403,
+            detail="This API docs instance is restricted to specific APIs. The given URL is not allowed.",
+        )
+
+
+def _fetch_external_openapi(openapi_url: str) -> dict:
+    # Fetch OpenAPI/Swagger spec from a URL. Tries multiple common paths when given a base URL.
+    _check_allowed_origin(openapi_url)
+    parsed = urlparse(openapi_url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(400, detail="openapi_url must be http or https")
+
+    url = openapi_url.strip().rstrip("/")
+    if url.lower().endswith(".json"):
+        # User provided a direct spec URL; use it as-is
+        candidates = [url]
+    else:
+        # Base URL: try common spec locations
+        candidates = [url + suffix for suffix in SPEC_URL_SUFFIXES]
+
+    last_error: str | None = None
+    for spec_url in candidates:
+        try:
+            with httpx.Client(timeout=OPENAPI_FETCH_TIMEOUT) as client:
+                r = client.get(spec_url)
+                r.raise_for_status()
+                data = r.json()
+        except httpx.HTTPStatusError as e:
+            last_error = f"Could not fetch spec: {e.response.status_code} from {spec_url}"
+            continue
+        except httpx.RequestError as e:
+            last_error = f"Could not fetch spec (check URL and network): {e!s}"
+            continue
+        except Exception as e:
+            last_error = f"Invalid response from {spec_url}: {e!s}"
+            continue
+
+        if not isinstance(data, dict):
+            last_error = f"Response from {spec_url} is not JSON object"
+            continue
+        if "paths" not in data:
+            raise HTTPException(
+                502,
+                detail="Fetched URL but it is not a valid OpenAPI/Swagger document (missing 'paths').",
+            )
+        if "openapi" not in data and "swagger" not in data:
+            raise HTTPException(
+                502,
+                detail="Fetched URL but it is not a valid OpenAPI/Swagger document (missing 'openapi' or 'swagger' field).",
+            )
+        return data
+
+    raise HTTPException(502, detail=last_error or "Failed to fetch OpenAPI spec from any tried URL.")
+
+
+def _base_url_from_openapi_url(openapi_url: str) -> str:
+    # Return base URL from openapi_url, stripping common spec filenames (openapi.json, swagger.json, api-docs).
+    parsed = urlparse(openapi_url.strip().rstrip("/"))
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    path_lower = path.lower()
+    if path_lower.endswith("openapi.json") or path_lower.endswith("swagger.json") or path_lower.endswith(".json") or path_lower.endswith("/api-docs"):
+        path = path.rsplit("/", 1)[0] or ""
+    return f"{parsed.scheme}://{parsed.netloc}{path}" if path else f"{parsed.scheme}://{parsed.netloc}"
+
+
+@app.get("/api/agent-docs")
+def api_agent_docs_json(
+    request: Request,
+    openapi_url: str | None = Query(None, description="External API base URL or direct OpenAPI/Swagger JSON URL"),
+):
+    # Structured docs payload for the docs UI. No params = this app's OpenAPI (or DEFAULT_OPENAPI_URL if set); openapi_url = fetch that API's spec.
+    effective_url = openapi_url or settings.default_openapi_url
+    if effective_url:
+        schema = _fetch_external_openapi(effective_url)
+        base_url = _base_url_from_openapi_url(effective_url)
+    else:
+        schema = custom_openapi()
+        base_url = str(request.base_url).rstrip("/")
+    data = build_api_reference_data(schema, base_url=base_url)
+    overview = generate_overview_summary(schema, settings.openai_api_key)
+    if overview:
+        data["overview_summary"] = overview
+    return data
+
+
+@app.get("/health")
+def health():
+    # Health check for load balancers and platforms.
+    return {"status": "ok"}
+
+
+@app.get("/docs", response_class=HTMLResponse)
+def api_reference_page(request: Request):
+    # Server-rendered API reference for this app's OpenAPI (legacy/alternate docs).
+    schema = custom_openapi()
+    base_url = str(request.base_url).rstrip("/")
+    return build_api_reference_html(schema, base_url=base_url)
+
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., description="user or assistant")
+    content: str = Field("", description="Message content")
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage] = Field(..., description="Conversation history")
+    openapi_url: str | None = Field(None, description="When set, use this API's OpenAPI (external API)")
+    context_tag_names: list[str] | None = Field(None, description="Optional list of API tag names to limit chat context to those modules")
+
+
+class GenerateExampleRequest(BaseModel):
+    path: str = Field(..., description="API path")
+    method: str = Field(..., description="GET, POST, etc.")
+    stack: str = Field(..., description="e.g. react-fetch, vue3, flutter")
+    base_url: str | None = None
+    openapi_url: str | None = Field(None, description="When set, use this API's OpenAPI for the operation (external API)")
+
+@app.post("/api/agent/chat")
+def api_agent_chat(request: Request, body: ChatRequest):
+    # Chat with the API docs agent. Option A: context-only. Option B: with tool-calling.
+    effective_url = body.openapi_url or settings.default_openapi_url
+    if effective_url:
+        schema = _fetch_external_openapi(effective_url)
+        base_url = _base_url_from_openapi_url(effective_url)
+    else:
+        schema = custom_openapi()
+        base_url = str(request.base_url).rstrip("/")
+    messages = [{"role": m.role, "content": m.content or ""} for m in body.messages]
+    reply = agent_chat(
+        messages=messages,
+        openapi_schema=schema,
+        base_url=base_url,
+        openai_api_key=settings.openai_api_key,
+        use_tools=True,
+        context_tag_names=body.context_tag_names,
+    )
+    return {"message": reply}
+
+
+@app.post("/api-reference/generate-example")
+def api_reference_generate_example(request: Request, body: GenerateExampleRequest):
+    effective_url = body.openapi_url or settings.default_openapi_url
+    if effective_url:
+        schema = _fetch_external_openapi(effective_url)
+        base_url = (body.base_url or _base_url_from_openapi_url(effective_url)).rstrip("/")
+    else:
+        schema = custom_openapi()
+        base_url = (body.base_url or str(request.base_url)).rstrip("/")
+    method = (body.method or "get").upper()
+    allowed = {s[0] for s in STACKS}
+    if body.stack not in allowed:
+        raise HTTPException(400, detail=f"stack must be one of: {', '.join(sorted(allowed))}")
+    op = get_operation(schema, body.path, method)
+    if not op:
+        raise HTTPException(404, detail=f"Operation {method} {body.path} not found in schema")
+    code = generate_example(
+        method=method,
+        path=body.path,
+        stack=body.stack,
+        operation=op,
+        base_url=base_url,
+        openai_api_key=settings.openai_api_key,
+    )
+    return {"code": code}
+
+
+# --- Serve frontend static export at /agent-docs (with SPA fallback) ---
+
+
+def _make_static_with_spa_fallback(directory: Path):
+    # ASGI app that serves static files and falls back to index.html for SPA client routes.
+    static = StarletteStaticFiles(directory=str(directory), html=True)
+    index_path = directory / "index.html"
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            await static(scope, receive, send)
+            return
+        got_404 = []
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start" and message.get("status") == 404:
+                got_404.append(True)
+                return  # Don't send 404 yet
+            if message["type"] == "http.response.body" and got_404:
+                return  # Drop 404 body
+            await send(message)
+
+        await static(scope, receive, send_wrapper)
+        if got_404 and index_path.is_file():
+            body = index_path.read_bytes()
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [[b"content-type", b"text/html; charset=utf-8"]],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+    return app
+
+
+if FRONTEND_OUT.is_dir():
+    # Redirect /agent-docs -> /agent-docs/ so static can serve index.html
+    @app.get("/agent-docs", include_in_schema=False)
+    def redirect_agent_docs():
+        return RedirectResponse(url="/agent-docs/", status_code=302)
+
+    app.mount(
+        "/agent-docs/",
+        _make_static_with_spa_fallback(FRONTEND_OUT),
+        name="frontend",
+    )
